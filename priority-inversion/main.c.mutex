@@ -1,0 +1,73 @@
+/*priority-inversion/main.c — the three task functions and main()*/
+
+/* resource protection: binary semaphore, NOT a mutex */
+static SemaphoreHandle_t xGpioAMutex;
+
+/* busy-wait: spins on a tick counter, never yields */
+static volatile uint32_t g_ticks = 0;
+void vApplicationTickHook(void) { g_ticks++; }
+
+static void busy_wait_ms(uint32_t ms)
+{
+    uint32_t start = g_ticks;
+    while ((g_ticks - start) < ms) { }   /* spin */
+}
+
+/* Task1 HIGH — blinks PA0 */
+static void task1_high(void *pv)
+{
+    vTaskDelay(pdMS_TO_TICKS(10));   /* small head-start lets Task2 grab sem first */
+    for (;;) {
+        xSemaphoreTake(xGpioAMutex, portMAX_DELAY);
+        GPIOA->ODR |=  (1U << 0);   vTaskDelay(pdMS_TO_TICKS(500));
+        GPIOA->ODR &= ~(1U << 0);   vTaskDelay(pdMS_TO_TICKS(500));
+        xSemaphoreGive(xGpioAMutex);
+    }
+}
+
+/* Task2 LOW — blinks PA1 */
+static void task2_low(void *pv)
+{
+    for (;;) {
+        xSemaphoreTake(xGpioAMutex, portMAX_DELAY);   /* takes sem at T=0 */
+        GPIOA->ODR |=  (1U << 1);   vTaskDelay(pdMS_TO_TICKS(500));
+        GPIOA->ODR &= ~(1U << 1);   vTaskDelay(pdMS_TO_TICKS(500));
+        xSemaphoreGive(xGpioAMutex);                   /* releases sem at T=1000 */
+    }
+}
+
+/* Task3 MED — blinks PC13, busy-waits 5×500 ms, then sleeps once */
+static void task3_med(void *pv)
+{
+    for (;;) {
+        for (uint32_t i = 0; i < 5; i++) {
+            GPIOC->ODR ^= (1U << 13);
+            busy_wait_ms(500);   /* SPIN — never yields — starves Task2 */
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));   /* only yields ONCE per outer loop */
+    }
+}
+
+int main(void)
+{
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPCEN;
+    gpio_output_init(GPIOA, 0);
+    gpio_output_init(GPIOA, 1);
+    gpio_output_init(GPIOC, 13);
+
+    /* BEFORE: binary semaphore — no priority awareness 
+xGpioAMutex = xSemaphoreCreateBinary();
+xSemaphoreGive(xGpioAMutex);   /* must pre-give a binary semaphore */
+    */
+
+/* AFTER: mutex — priority inheritance included */
+xGpioAMutex = xSemaphoreCreateMutex();
+/* a mutex starts available — no pre-give needed */
+
+    xTaskCreate(task1_high, "T1_HIGH", configMINIMAL_STACK_SIZE, NULL, PRIO_HIGH, NULL);
+    xTaskCreate(task2_low,  "T2_LOW",  configMINIMAL_STACK_SIZE, NULL, PRIO_LOW,  NULL);
+    xTaskCreate(task3_med,  "T3_MED",  configMINIMAL_STACK_SIZE, NULL, PRIO_MED,  NULL);
+
+    vTaskStartScheduler();
+    for (;;) {}
+}
